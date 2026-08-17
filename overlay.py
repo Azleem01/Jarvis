@@ -63,6 +63,35 @@ _REPLY_MAX_S = 12.0
 _THINKING_STALL_S = 120.0
 _STALL_MESSAGE = "Still working — no update for a while."
 
+# HUD gets out of the way: if the cursor comes within this many px of the panel
+# it hops to whichever vertical slot (top or bottom of the screen) is farther
+# from the cursor, so it never sits under what the user is pointing at — and the
+# corner-cancel gesture behind it stays reachable.
+_AVOID_MARGIN = 60
+
+# Animation tick cadence. The HUD only animates while it is showing, but the
+# tick also has to keep draining its queue to notice the next show/reply. Doing
+# that at 30 fps around the clock kept the CPU out of deep idle and cost real
+# battery for nothing — the panel is hidden the vast majority of the time. So
+# the tick runs fast only while visible and idles slowly while hidden; a queued
+# show/reply is still picked up within one slow tick and snaps back to fast.
+_ACTIVE_TICK_MS = 33   # ~30 fps while the HUD is on screen
+_IDLE_TICK_MS = 150    # ~7 Hz while hidden — enough to stay responsive
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _cursor_xy():  # noqa: ANN202
+    """Current mouse position in physical pixels, or None if it can't be read."""
+    try:
+        pt = _POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return pt.x, pt.y
+    except (AttributeError, OSError):
+        return None
+
 
 def _dpi_scale() -> float:
     """Physical-pixel scale factor.
@@ -162,11 +191,15 @@ class Overlay:
         )
         self.canvas.pack()
 
-        # Bottom-centre, clear of the taskbar.
+        # Bottom-centre, clear of the taskbar. Two vertical slots exist so the
+        # HUD can flee the cursor: its default bottom slot and a top slot.
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         self._x = (sw - self.w) // 2
-        self._y = sh - self.h - int(110 * s)
+        self._y_bottom = sh - self.h - int(110 * s)
+        self._y_top = int(60 * s)
+        self._y = self._y_bottom
+        self._cur_y = self._y_bottom     # slot the panel currently occupies
         self.root.geometry(f"{self.w}x{self.h}+{self._x}+{self._y}")
 
         self._build()
@@ -300,6 +333,7 @@ class Overlay:
                 self._started_at = time.monotonic()
                 self._level = self._peak = 0.0
                 self._apply_state()
+                self._reset_position()  # each new take starts in the bottom slot
                 if not self._visible:
                     self._visible = True
                     self.root.deiconify()
@@ -376,8 +410,45 @@ class Overlay:
         if self._stopping:
             return
         if self._visible:
+            self._avoid_cursor()
             self._animate()
-        self.root.after(33, self._tick)  # ~30 fps
+        self.root.after(self._tick_delay_ms(), self._tick)
+
+    def _tick_delay_ms(self) -> int:
+        """Fast while the HUD shows, slow while it's hidden (battery)."""
+        return _ACTIVE_TICK_MS if self._visible else _IDLE_TICK_MS
+
+    # -- get out of the cursor's way -----------------------------------------
+    def _reset_position(self) -> None:
+        self._cur_y = self._y_bottom
+        self.root.geometry(f"{self.w}x{self.h}+{self._x}+{self._cur_y}")
+
+    def _avoid_cursor(self) -> None:
+        """Hop to the slot farthest from the cursor if it's hovering the panel.
+
+        The panel is click-through, so it can't be dragged out of the way — it
+        moves itself. Once it hops, the cursor is no longer over it, so it
+        settles; chase it and it flees again.
+        """
+        pos = _cursor_xy()
+        if pos is None:
+            return
+        x, y = pos
+        over = (
+            self._x - _AVOID_MARGIN <= x <= self._x + self.w + _AVOID_MARGIN
+            and self._cur_y - _AVOID_MARGIN <= y <= self._cur_y + self.h + _AVOID_MARGIN
+        )
+        if not over:
+            return
+        top_center = self._y_top + self.h / 2
+        bottom_center = self._y_bottom + self.h / 2
+        target = (
+            self._y_top if abs(y - top_center) > abs(y - bottom_center)
+            else self._y_bottom
+        )
+        if target != self._cur_y:
+            self._cur_y = target
+            self.root.geometry(f"{self.w}x{self.h}+{self._x}+{self._cur_y}")
 
     def _animate(self) -> None:
         import math

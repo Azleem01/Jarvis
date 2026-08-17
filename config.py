@@ -29,16 +29,22 @@ GEMINI_MODEL: str = _get("GEMINI_MODEL", "gemini-3.6-flash")
 
 # Fallback chain used when the primary model is rate limited, out of quota, or
 # retired. Every model here supports both function calling and vision, which is
-# what Jarvis needs (routing + on-screen element location). Ordered strongest
-# first; the "-lite" and "-latest" aliases sit at the end as last resorts
-# because they draw on separate quota pools from the numbered models.
+# what Jarvis needs (routing + on-screen element location).
+#
+# Ordering is "fastest-that-works first, with a capability tier reachable" —
+# *not* strongest-first. On paid credits the flash primary answers almost
+# everything in a couple of seconds; the chain only walks on an outage. So the
+# fast flash models lead, one pro model sits mid-chain as a capability/reliability
+# escalation for when the flash tier is genuinely unavailable, and the "-lite"
+# and "-latest" aliases sit at the end as last resorts (they draw on separate
+# quota pools from the numbered models). All IDs verified against the live
+# models.list() API — a non-existent primary 404s into a 24 h retirement.
 _DEFAULT_FALLBACK_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-flash-latest",
+    "gemini-3.6-flash",         # fast + capable — carries almost all traffic
+    "gemini-3.5-flash",         # fast fallback, separate quota
+    "gemini-flash-latest",      # fast alias, separate quota pool
+    "gemini-pro-latest",        # capability/reliability escalation (slower)
+    "gemini-3.5-flash-lite",    # cheap, quick last resorts
     "gemini-flash-lite-latest",
 ]
 
@@ -73,7 +79,13 @@ OPENROUTER_API_KEY: str = _get("OPENROUTER_API_KEY")
 
 # Which provider serves vision requests first: "openrouter" or "gemini".
 # Routing always stays on Gemini — free models route measurably worse.
-VISION_PROVIDER: str = _get("VISION_PROVIDER", "openrouter").strip().lower()
+#
+# Default is "gemini": with paid credits the reliable, fast path is Gemini's own
+# vision, and the free shared OpenRouter endpoints (which stall/429 before
+# answering) become the fallback rather than the first thing tried. Set
+# "openrouter" to prefer the free models first and spend Gemini credits only on
+# fallback.
+VISION_PROVIDER: str = _get("VISION_PROVIDER", "gemini").strip().lower()
 
 # Two chains, and they are NOT interchangeable. Benchmarked against generated
 # quiz pages with known option positions:
@@ -200,6 +212,20 @@ def _load_contacts() -> dict[str, str]:
 
 
 WHATSAPP_CONTACTS: dict[str, str] = _load_contacts()
+
+# ---- Self-extension (Azleem writing its own tools) -------------------------
+# Master switch for add_capability, which lets Azleem write a NEW tool into its
+# own tools/generated/ package and restart to load it. Off makes the tool
+# refuse honestly rather than touch its own source.
+SELF_EXTEND_ENABLED: bool = _get("SELF_EXTEND_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+# How long the pre-install safety checks (import + Gemini-schema build +
+# tests/test_prompts) may run before a self-extension is refused as unverified.
+# The whole point of the gate is that a broken new tool never becomes live, so
+# an unverifiable one is treated as a failed one.
+SELF_EXTEND_TEST_TIMEOUT: float = float(_get("SELF_EXTEND_TEST_TIMEOUT", "180"))
 
 
 def validate() -> None:

@@ -66,7 +66,7 @@ hotkey (pynput listener thread)
 | `stt_engine.py` | `Recorder` (sounddevice) + `Transcriber` (faster-whisper) |
 | `build_info.py` | Source fingerprint — the staleness guard |
 | `config.py` | All `.env` settings |
-| `tools/` | The 13 callables Gemini can invoke |
+| `tools/` | The callables Gemini can invoke (20, incl. `accomplish_with_code`) |
 | `intents.py` | Local fast paths — commands answered with no model call |
 | `providers.py` | Which provider serves vision vs routing |
 | `openrouter_client.py` | Free-model chain; same shape as `gemini_client` |
@@ -233,6 +233,160 @@ looked absent: `open_url(browser=…)` would silently use the default browser
 while reporting the named one "not found". Use `QueryValueEx` plus
 `os.path.expandvars`. Found only because the new launch gate reused the helper
 and refused an app that was plainly installed.
+
+**24. Esc is cooperative — you cannot interrupt a blocking call, so decouple the
+UI instead.** A Python thread can't be killed and an in-flight HTTP/Whisper call
+can't be aborted mid-request, so pressing Esc used to set the flag and then wait
+out the whole call (up to the timeout) before the HUD reacted. The fix is
+two-part: `_cancel_current` (shared by Esc and the corner watcher) makes the
+*experience* instant — it bumps `_active_seq` so the worker is immediately stale
+(its late reply is discarded by the same guard `_report_progress` uses) and drops
+a terminal "Cancelled." on the HUD — while the *worker* frees its `_busy` slot
+within a few seconds because the request timeout is now 20 s and
+`gemini_client`/`quiz`/`computer_use` poll `cancellation.cancelled()` between
+calls. Never try to make Esc "kill" the work; make the UI stop waiting on it.
+
+**25. A corner cancel needs BOTH axes at an extreme — `and`, not `or`.** The
+middle of a screen edge is a place the cursor sits constantly; only a true corner
+(both x and y pinned) is an intentional gesture. `main._in_corner` uses `and`;
+an `or` there cancels the running task on ordinary mousing. Guarded by
+`test_concurrency.TestCornerDetection`.
+
+**26. Cancellable code execution needs a subprocess, not `exec`.**
+`accomplish_with_code` (the action-capable escape hatch) runs model-written
+Python that may act on the machine. It runs the script as a child process so a
+cancel can `terminate()` it — an in-process `exec` could not be interrupted, the
+same wall Esc hits everywhere else. It also does **no** auto-repair (unlike
+`solve_with_python`): re-running a script that may have already caused a side
+effect could redo it. Output streams straight to `output.txt`, never a pipe, so
+a chatty child can't deadlock on a full buffer.
+
+**27. Self-modification lives in `tools/generated/`, never the core.**
+`add_capability` lets Azleem write a *new tool into itself*. Every self-written
+tool lands in the `tools/generated/` package, loaded there behind a `try/except`
+guard (`llm_agent` imports it defensively; the loader skips any module that fails
+to import). The hand-written core (`llm_agent.py`, `main.py`) is never edited by
+Azleem. That isolation is the whole safety story: a bad generated tool degrades to
+"no extra tools", it cannot brick startup, and rollback is deleting one file. Each
+generated module follows a fixed convention — one typed `def`, a docstring, and
+`TOOL = fn` + `ROUTING = "- name: …"`. No `from __future__ import annotations`
+either (gotcha 1 applies to self-written tools too; guarded by the extended
+`test_no_future_annotations_in_tools` and `TestSelfExtension`).
+
+**28. A self-restart must be spawned DETACHED, or it kills itself mid-call.**
+`restart.ps1`'s first act is `Stop-Process -Force` on the running Azleem. So
+`self_restart.spawn_restart` launches it with `DETACHED_PROCESS |
+CREATE_NEW_PROCESS_GROUP` and a brief `Start-Sleep` (so the HUD paints its
+"restarting" reply first). An in-process `subprocess.run` would stop the very
+process making the call before the relaunch line runs, and nothing would come
+back up. The singleton-mutex wait a naive self-restart would deadlock on is
+already handled inside `restart.ps1` — don't reimplement it.
+
+**29. `add_capability` is armed, not fired — like `power_action`.** It is a
+two-step: the first call *writes and describes* the candidate tool; only a second
+call with `confirm=True`, after the user actually says "confirm", installs and
+restarts. A single mis-transcription cannot rewrite the codebase. And the tool is
+*verified before it goes live* — on confirm the module is imported in a
+subprocess, built into a Gemini function declaration, and run through
+`tests/test_prompts`; any failure rolls the file back and refuses to restart
+(`test_validation_failure_rolls_back_and_does_not_restart`,
+`test_confirm_without_arming_never_restarts`). The subprocess import is
+deliberately NOT the guarded package loader, which would swallow a broken module
+and report success.
+
+**30. Self-extension writes the *tool*, it cannot conjure *credentials*.** A
+generated email/API tool still needs an account: the generator is told to read
+secrets from environment variables and return the missing variable's name when it
+is absent. "Azleem can grow a new tool" is a different claim from "Azleem can do
+anything without setup" — say so honestly rather than implying the capability is
+live when only the code exists.
+
+**31. The overlay tick must idle when the HUD is hidden.** `_tick` used to
+reschedule at 33 ms (~30 fps) *forever*, even hidden — a constant CPU wakeup
+source that blocked deep idle and cost real battery, since the panel is hidden the
+vast majority of the time. `_tick_delay_ms` now returns 33 ms only while visible
+and 150 ms while hidden; a queued show/reply is still picked up within one slow
+tick and snaps back to full speed. Guarded by `TestIdleTickThrottle`. (The audio
+stream is already closed at idle and the resident Whisper model is a RAM cost, not
+CPU — this tick was the one always-on CPU drain.)
+
+---
+
+## Latest round — self-extension, and a quieter idle
+
+Two asks: Azleem should be able to **write its own code to edit its own codebase**
+when a task exceeds its tools (the example: emailing someone), gaining the
+capability *permanently*; and it was suspected of **draining the laptop battery**,
+which needed optimising and attributing.
+
+- **Self-extension (`add_capability`).** Gotchas 27–30. A new tool that writes a
+  fresh tool module into the isolated `tools/generated/` package, verifies it
+  (subprocess import + Gemini-schema build + `tests/test_prompts`), and — gated
+  behind a spoken "confirm", with automatic rollback on failure — restarts Azleem
+  detached to load it. The original request is carried across the restart in
+  `logs/pending_command.json` and run automatically on startup
+  (`main.dispatch_pending`), so the new capability is used immediately. New files:
+  `tools/self_extend.py`, `tools/generated/__init__.py`, `self_restart.py`. The
+  core edit to `llm_agent.py` is minimal and guarded: fold `tools.generated.TOOLS`
+  and `.ROUTING` into the per-request tool list and prompt, register
+  `add_capability`, add one confirm-gated routing bullet. `main._process` was
+  refactored into `_begin_worker` + `_answer` so a text command (the pending one)
+  reuses the exact command path minus transcription.
+- **Idle battery.** Gotcha 31. The 30 fps overlay tick now idles at ~7 Hz while
+  hidden. Everything else was already power-clean. For zero idle cost with no
+  visual HUD, `SHOW_OVERLAY=false` swaps in `_NullOverlay` (blocks on an event,
+  no tick at all).
+
+Verified: **337 offline tests** (up from 313), the real validation gate exercised
+both ways against an actual generated module (clean → `(True, '')`, syntax error →
+refused), three mutations caught and restored (overlay idle interval, the
+validation-failure rollback, arm-must-not-install). Config: `SELF_EXTEND_ENABLED`
+(kill switch) and `SELF_EXTEND_TEST_TIMEOUT`.
+
+Out of scope / honest limits: a generated tool that *runs* is not proof it
+*works* live (credentials, gotcha 30); the pending command re-run uses the model's
+paraphrase of the request, not the raw utterance; and self-extension is a genuine
+power tool — the confirm gate and rollback are what make it safe, not a claim that
+the generated code is always correct.
+
+---
+
+## Latest round — responsiveness, paid Gemini, and a code escape hatch
+
+Reported: "what's on my screen" thought for ~a minute; Esc took 5–30 s (or never)
+to cancel; and two feature asks — a code-writing escape hatch for tasks no tool
+covers, and a cursor-to-corner cancel gesture. Now on paid Google AI Studio
+credits.
+
+- **R16 — instant screen-read.** "what's on my screen" wasn't fast-pathed, so it
+  paid two Gemini routing round-trips + a vision call. `intents.py` gained the
+  one screen-touching fast path — a closed, anchored set of bare phrasings
+  ("what's on my screen", "read my screen") dispatched straight to `read_screen`.
+  Anything with a target, a second clause or a pronoun fails the anchor and falls
+  through (gotcha 20). Refusals in `test_intents.TestReadScreen` outweigh matches.
+- **R17 — rebalanced chain + Gemini-first vision.** The `gemini-3.x` IDs are
+  real (verified against live `models.list()` — the earlier "fictional" worry was
+  a stale knowledge cutoff). Chain is now fastest-first with a `gemini-pro-latest`
+  escalation mid-chain and lite aliases last. Vision flipped to `gemini` first
+  with **free OpenRouter kept as a genuine fallback** (`providers.vision_generate`
+  restructured; `VISION_PROVIDER=gemini` no longer means "gemini only"). Request
+  timeout cut 60 s → 20 s.
+- **R18 — instant Esc + corner cancel.** Gotchas 24–25. Esc and a screen-corner
+  gesture share `_cancel_current`; the overlay also slides to the opposite slot
+  when the cursor nears it (`overlay._avoid_cursor`).
+- **R19 — `accomplish_with_code`.** Gotcha 26. A last-resort tool (kept distinct
+  from `solve_with_python`) that writes and runs system-acting Python in a
+  cancellable subprocess. Arbitrary code execution, by the user's explicit
+  choice, bounded by subprocess isolation + a 60 s timeout + saved scripts.
+
+Verified: **313 offline tests** (up from 305), four mutations caught and
+restored (corner `and`→`or`, the cancel seq-bump, the subprocess cancel check,
+the read-screen rule), build stamps matched after `restart.ps1`, and the live
+banner shows `vision: gemini -> openrouter fallback`.
+
+Out of scope, unchanged: the free-tier quiz burn is moot on paid credits; Esc
+during a single in-flight request still waits out that one request (capped at
+20 s now) — only the chain-walk after it is cut short.
 
 ---
 

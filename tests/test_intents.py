@@ -116,10 +116,17 @@ class TestRefusals(unittest.TestCase):
                      "take a screenshot and send it to sam"):
             self.assertFallsThrough(text)
 
-    def test_anything_involving_the_screen(self):
+    def test_screen_commands_that_act_fall_through(self):
+        # A bare "read the whole screen" is now fast-pathed (see TestReadScreen),
+        # but anything that ACTS on the screen, targets a specific element, or
+        # carries a second clause must still go to the model.
         for text in ("solve the quiz question on my screen",
                      "answer the quiz on my screen and move to the next one",
-                     "read my screen", "what's on my screen"):
+                     "what's the answer on my screen",
+                     "read the third line on my screen",
+                     "what's on my screen and solve it",
+                     "read my screen then close the window",
+                     "click the button on my screen"):
             self.assertFallsThrough(text)
 
     def test_site_searches_are_not_plain_opens(self):
@@ -173,6 +180,55 @@ class TestRefusals(unittest.TestCase):
         guess, and the model has the whole alias table plus judgement."""
         for text in ("open coursera in chrome", "open my bank site in edge"):
             self.assertFallsThrough(text)
+
+
+class TestReadScreen(unittest.TestCase):
+    """The one screen-touching fast path: a bare 'read the whole screen'.
+
+    Justified because the intent (describe the whole screen) is unambiguous for
+    a closed set of exact phrasings. The refusals are weighted heavier than the
+    matches, per this module's rule that a wrong instant answer is worse than a
+    right slow one.
+    """
+
+    def assertReadsScreen(self, text):
+        resolved = intents.match(text)
+        self.assertIsNotNone(
+            resolved, f"{text!r} should fast-path to read_screen")
+        name, payload = resolved
+        self.assertEqual(name, "read_screen", f"{text!r} -> {name}")
+        self.assertIn("query", payload)
+
+    def test_bare_read_phrasings_match(self):
+        for text in ("what's on my screen", "what is on my screen",
+                     "what's on the screen", "whats on my screen",
+                     "what's currently on my screen", "what on my screen",
+                     "read my screen", "read the screen",
+                     "what does my screen say", "what does the screen say",
+                     "describe my screen", "describe the screen"):
+            with self.subTest(text=text):
+                self.assertReadsScreen(text)
+
+    def test_polite_wrappers_still_match(self):
+        for text in ("hey azleem, what's on my screen please",
+                     "could you read my screen for me",
+                     "so what's on my screen"):
+            with self.subTest(text=text):
+                self.assertReadsScreen(text)
+
+    def test_targeted_or_multiclause_reads_fall_through(self):
+        # A specific target, a second clause, or a pronoun means it is not a
+        # bare whole-screen read — the model must route it.
+        for text in ("what's the answer on my screen",
+                     "read the third line on my screen",
+                     "what's on my screen and solve it",
+                     "read my screen then close it",
+                     "read it", "what colour is my screen",
+                     "what app is on my screen"):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    intents.match(text),
+                    f"{text!r} matched but is not a bare whole-screen read")
 
 
 class TestMachineControl(unittest.TestCase):

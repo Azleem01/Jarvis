@@ -11,6 +11,14 @@ import threading
 _cancel = threading.Event()
 
 
+class Cancelled(RuntimeError):
+    """Raised by a long-running call that noticed the cancel flag and bailed.
+
+    Distinct from an error: the user asked for this, so callers should treat it
+    as a clean stop (report "Cancelled." and record nothing), not a failure.
+    """
+
+
 def request_cancel() -> None:
     _cancel.set()
 

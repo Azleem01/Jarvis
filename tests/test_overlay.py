@@ -177,6 +177,28 @@ class TestStateTransitions(OverlayTestCase):
         self.assertLessEqual(len(self.hud._fit_reply(self.hud._reply_text)), 221)
 
 
+class TestIdleTickThrottle(OverlayTestCase):
+    """The tick used to reschedule at 30 fps forever, even hidden — a constant
+    CPU wakeup source that cost battery for nothing. It must slow down at rest.
+    """
+
+    def test_hidden_hud_ticks_slowly(self):
+        self.assertFalse(self.hud._visible)
+        self.assertEqual(
+            self.hud._tick_delay_ms(), overlay_mod._IDLE_TICK_MS,
+            "A hidden HUD must idle its tick, not run at full frame rate.",
+        )
+
+    def test_visible_hud_ticks_fast(self):
+        self.hud.show()
+        self.pump()
+        self.assertTrue(self.hud._visible)
+        self.assertEqual(self.hud._tick_delay_ms(), overlay_mod._ACTIVE_TICK_MS)
+
+    def test_idle_interval_is_slower_than_active(self):
+        self.assertGreater(overlay_mod._IDLE_TICK_MS, overlay_mod._ACTIVE_TICK_MS)
+
+
 class TestNullOverlay(unittest.TestCase):
     """The headless stand-in must satisfy the same surface."""
 

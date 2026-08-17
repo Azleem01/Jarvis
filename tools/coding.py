@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -29,6 +30,10 @@ import config
 import gemini_client
 
 _TIMEOUT_S = 30
+# The action tool is allowed to do real work (open things, fetch, type), which
+# can legitimately take longer than a pure calculation, so it gets a longer
+# ceiling. Still bounded — a runaway script must always end.
+_ACTION_TIMEOUT_S = 60
 _CODE_PROMPT = (
     "Write a complete, self-contained Python 3 script that accomplishes this "
     "task:\n{task}\n\n"
@@ -40,6 +45,18 @@ _REPAIR_PROMPT = (
     "This Python script failed. Fix it and respond with ONLY the corrected "
     "code — no markdown fences, no commentary.\n\n"
     "TASK:\n{task}\n\nSCRIPT:\n{code}\n\nERROR OUTPUT:\n{error}"
+)
+_ACTION_PROMPT = (
+    "Write a complete, self-contained Python 3 script that accomplishes this "
+    "task on a Windows machine:\n{task}\n\n"
+    "You MAY act on the system to do it: use any installed library — pyautogui "
+    "for keyboard and mouse, the standard urllib or the requests library for "
+    "the web, pathlib and os for files, subprocess for running programs. Do "
+    "only what the task asks and nothing more. Do not delete or overwrite the "
+    "user's files unless the task explicitly says to. End the script by "
+    "printing a short, plain-language summary of what it actually did. No "
+    "input() calls, no interactive prompts, no infinite loops. "
+    "Respond with ONLY the Python code — no markdown fences, no commentary."
 )
 
 
@@ -101,6 +118,96 @@ def solve_with_python(task: str) -> str:
     hint = "" if config.GITHUB_TOKEN else \
         " (Add GITHUB_TOKEN to .env to get shareable links.)"
     return f"{status}. Output: {excerpt} — saved in {folder}.{hint}"
+
+
+def accomplish_with_code(task: str) -> str:
+    """Last resort: accomplish a task by writing and running a Python program.
+
+    Use ONLY when no other tool fits. There are dedicated tools for launching
+    apps, opening websites, reading the screen, answering quizzes, finding
+    files, messaging, volume, brightness, alarms, notes and window control —
+    always prefer those. This one writes a fresh Python program to do something
+    none of them cover, runs it on this machine, and reports what it did. The
+    program is allowed to act on the system (files, the web, the keyboard and
+    mouse), so it is open-ended and powerful; reach for it only when the request
+    genuinely has no dedicated tool. The generated program is saved so the user
+    can see exactly what was run.
+
+    Args:
+        task: A full natural-language description of what to accomplish.
+
+    Returns:
+        A status string describing the outcome.
+    """
+    code = _generate(_ACTION_PROMPT.format(task=task))
+    if code is None:
+        return "I couldn't write a program for that right now."
+    if cancellation.cancelled():
+        return "Aborted — you cancelled."
+
+    folder = _solution_folder(task)
+    script = folder / "action.py"
+    script.write_text(code + "\n", encoding="utf-8")
+
+    # No auto-repair here, unlike solve_with_python: this script may have already
+    # changed the system, so silently re-running a "fixed" version could redo a
+    # side effect. One shot; if it errors, report the error honestly.
+    ok, output = _run_cancellable(script, _ACTION_TIMEOUT_S)
+    (folder / "output.txt").write_text(output, encoding="utf-8")
+
+    if cancellation.cancelled():
+        return "Stopped — you cancelled while it was running."
+
+    excerpt = " / ".join(output.strip().splitlines()[:3])[:180]
+    if ok:
+        return f"Done. {excerpt}" if excerpt else "Done."
+    return f"It didn't fully succeed. {excerpt} — the script is saved in {folder}."
+
+
+def _run_cancellable(script: Path, timeout: int) -> "tuple[bool, str]":
+    """Run a script as a child process that Esc/corner cancel can actually stop.
+
+    Output streams straight to output.txt (not a pipe), which both saves it for
+    inspection and avoids a full pipe buffer deadlocking a chatty child. The
+    poll loop is what makes cancellation real: an in-process ``exec`` couldn't be
+    interrupted, but a separate process can be terminated.
+    """
+    out_path = script.parent / "output.txt"
+    cancelled = timed_out = False
+    with open(out_path, "w", encoding="utf-8") as fh:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdout=fh, stderr=subprocess.STDOUT, cwd=str(script.parent),
+        )
+        start = time.monotonic()
+        while proc.poll() is None:
+            if cancellation.cancelled():
+                cancelled = True
+                _terminate(proc)
+                break
+            if time.monotonic() - start > timeout:
+                timed_out = True
+                _terminate(proc)
+                break
+            time.sleep(0.1)
+
+    output = out_path.read_text(encoding="utf-8", errors="replace").strip()
+    if cancelled:
+        return False, (output + "\n(cancelled — the running script was stopped)").strip()
+    if timed_out:
+        return False, (output + f"\n(exceeded the {timeout}s time limit)").strip()
+    return proc.returncode == 0, output or "(no output)"
+
+
+def _terminate(proc: "subprocess.Popen") -> None:
+    """Ask a child process to stop, and force-kill it if it won't."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except OSError:
+        pass
 
 
 def _generate(prompt: str):

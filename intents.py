@@ -58,6 +58,25 @@ def _screenshot(_m):
     return "take_screenshot", {}
 
 
+# The generic "read the whole screen" query. read_screen takes any query; a
+# general description is what "what's on my screen" asks for.
+_DESCRIBE_QUERY = "Everything currently visible on the screen, described briefly."
+
+
+def _read_screen(_m):
+    """Dispatch a bare 'what's on my screen' straight to read_screen.
+
+    This is the one screen-touching fast path (see the module docstring's rule).
+    It is safe *because the rule below is anchored to a closed set of exact
+    phrasings* — the whole-screen read is the unambiguous intent of every one of
+    them. Anything with a specific target ("what's the ANSWER on my screen",
+    "read the THIRD LINE"), a second clause ("...and solve it"), or a pronoun
+    fails the `^...$` anchor and falls through to the model, which is where a
+    command that means more than "describe the screen" belongs.
+    """
+    return "read_screen", {"query": _DESCRIBE_QUERY}
+
+
 # Words that survive as a bare "app name" but name nothing: "open up" must not
 # launch an application called "up". A pronoun means the target was contextual,
 # which the fast path has no context to resolve.
@@ -170,6 +189,18 @@ _RULES = [
     (re.compile(r"^(?:take|grab|capture|get)\s+(?:a\s+|the\s+)?"
                 r"(?:screen\s*shot|screen\s*grab|screenie)$", re.I), _screenshot),
     (re.compile(r"^screen\s*shot$", re.I), _screenshot),
+
+    # Reading the whole screen: "what's on my screen", "read my screen". A
+    # closed set of exact phrasings, anchored end to end — the moment a specific
+    # target, a second clause or a pronoun appears, the anchor fails and it
+    # falls through to the model. Comes before the app rule so "read the screen"
+    # can't be misread as launching an app called "screen".
+    (re.compile(r"^(?:"
+                r"what(?:'?s| is)?\s+(?:currently\s+)?on\s+(?:my\s+|the\s+)?screen"
+                r"|read\s+(?:my|the)\s+screen"
+                r"|what\s+does\s+(?:my|the)\s+screen\s+say"
+                r"|describe\s+(?:my|the)\s+screen"
+                r")$", re.I), _read_screen),
 
     # A known site *and* a named browser: "open youtube on my chrome browser".
     # Must come before the app rule, which would otherwise swallow the whole

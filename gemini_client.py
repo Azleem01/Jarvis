@@ -36,13 +36,17 @@ from typing import Any
 from google import genai
 from google.genai import types as genai_types
 
+import cancellation
 import config
 
 # Per-request HTTP timeout (ms). Without one the SDK waits forever, and a
 # single wedged connection freezes the whole assistant — observed live: a
 # fallback attempt hung >30s while the same model answered a fresh client in
-# 4.5s. Generous because tool-calling turns and vision requests are slow.
-_REQUEST_TIMEOUT_MS = 60_000
+# 4.5s. On paid credits a real answer (even a tool-calling or vision turn)
+# comes back in a few seconds, so this caps the worst-case wedged request at
+# 20s instead of 60s — the ceiling the user feels when they press Esc and the
+# thread is stuck mid-call. Raise it if legitimate slow turns start timing out.
+_REQUEST_TIMEOUT_MS = 20_000
 
 # Status codes worth retrying on a different model.
 _QUOTA_CODES = {429}
@@ -244,6 +248,13 @@ class ModelRouter:
         errors: list[str] = []
         order = self._order()
         for position, model in enumerate(order):
+            # Esc/corner cancel: stop walking the chain the moment the user
+            # aborts, so a cancelled command doesn't pay out the remaining
+            # models' timeouts before the worker can release its slot. (A single
+            # in-flight request can't be interrupted, but the per-request timeout
+            # caps how long that lasts; this stops everything after it.)
+            if cancellation.cancelled():
+                raise cancellation.Cancelled("cancelled before contacting Gemini")
             try:
                 response = self._generate_with_network_retry(
                     model, contents, gen_config

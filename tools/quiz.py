@@ -266,6 +266,13 @@ def answer_quiz(scope: str = "") -> str:
         print(f"[quiz] Q{number}: {question}")
         print(f"[quiz]   -> {letter}. {answer_text}  (confidence: {confidence})")
 
+        # A cancel during the (blocking) answer call must stop us before we
+        # click anything — the top-of-loop check only fires between questions,
+        # and each question makes several long calls.
+        if cancellation.cancelled():
+            stopped = "you cancelled"
+            break
+
         # -- select the answer, and confirm it actually took ------------------
         option_box = _locate(f'the answer option whose text is exactly "{answer_text}"',
                              jpeg)
@@ -338,6 +345,9 @@ def answer_quiz(scope: str = "") -> str:
             else:
                 box = advance_box
 
+            if cancellation.cancelled():
+                stopped = "you cancelled"
+                break
             if not _click_box(box, after.size):
                 stopped = "the fail-safe triggered (mouse in a screen corner)"
                 break

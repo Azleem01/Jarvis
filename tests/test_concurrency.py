@@ -224,10 +224,38 @@ class TestEscCancel(JarvisTestCase):
         self.jarvis._on_press(keyboard.Key.esc)
 
     def test_esc_while_working_cancels(self):
+        import cancellation
+        cancellation.reset()
+        self.addCleanup(cancellation.reset)
         self.jarvis._working.set()
         self.addCleanup(self.jarvis._working.clear)
+        before = self.jarvis._active_seq
         self.esc()
-        self.assertIn(("state", "thinking"), self.hud.calls)
+        # The cancel is instant and terminal, not a repaint of "thinking": the
+        # flag is set, the current worker's generation is bumped (so its late
+        # reply is discarded), _working is cleared, and the HUD shows a reply.
+        self.assertTrue(cancellation.cancelled())
+        self.assertGreater(self.jarvis._active_seq, before)
+        self.assertFalse(self.jarvis._working.is_set())
+        self.assertIn(("reply", "Cancelled."), self.hud.calls)
+        self.assertNotIn(("state", "thinking"), self.hud.calls)
+
+    def test_cancel_makes_the_running_worker_stale(self):
+        """The decoupling: after a cancel, the in-flight worker is abandoned so
+        its late reply can never repaint over 'Cancelled.'."""
+        import cancellation
+        cancellation.reset()
+        self.addCleanup(cancellation.reset)
+        self.jarvis._working.set()
+        self.addCleanup(self.jarvis._working.clear)
+        self.jarvis._local.seq = self.jarvis._active_seq  # this "worker" is current
+        self.assertFalse(self.jarvis._is_stale())
+        self.esc()
+        self.assertTrue(
+            self.jarvis._is_stale(),
+            "A cancelled worker was not marked stale, so its blocking call's "
+            "late result would still repaint the HUD.",
+        )
 
     def test_esc_after_reply_does_not_repaint_thinking(self):
         """_busy is still held here; _working is not."""
@@ -301,6 +329,40 @@ class TestStaleProgress(JarvisTestCase):
             self.hud.final[0], "reply",
             "The delivered reply was overwritten by a stale progress update.",
         )
+
+
+class TestCornerDetection(unittest.TestCase):
+    """The whole-task cancel gesture: cursor driven into a screen corner.
+
+    A corner needs BOTH axes at an extreme. The middle of an edge — which normal
+    mousing crosses constantly — must never count, or the assistant would cancel
+    itself all the time.
+    """
+
+    def _in_corner(self, *args):
+        import main as main_mod
+        return main_mod._in_corner(*args)
+
+    def test_each_corner_triggers(self):
+        w, h = 1920, 1080
+        for x, y in [(0, 0), (1919, 0), (0, 1079), (1919, 1079),
+                     (3, 3), (1916, 1076)]:
+            with self.subTest(pos=(x, y)):
+                self.assertTrue(self._in_corner(x, y, w, h))
+
+    def test_edges_and_centre_do_not_trigger(self):
+        w, h = 1920, 1080
+        for x, y in [(960, 0),      # top edge, mid
+                     (0, 540),      # left edge, mid
+                     (960, 540),    # dead centre
+                     (960, 1079),   # bottom edge, mid
+                     (1919, 540)]:  # right edge, mid
+            with self.subTest(pos=(x, y)):
+                self.assertFalse(
+                    self._in_corner(x, y, w, h),
+                    "the middle of an edge was treated as a corner — normal "
+                    "mousing would cancel the running task",
+                )
 
 
 class TestRecorderThreadSafety(unittest.TestCase):

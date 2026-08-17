@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from google.genai import types  # noqa: E402
 
 import config  # noqa: E402
+import gemini_client as gcc  # noqa: E402
 import openrouter_client as orc  # noqa: E402
 
 
@@ -172,7 +173,33 @@ class TestFallback(unittest.TestCase):
 
 
 class TestProviderDispatch(unittest.TestCase):
-    """providers.vision_generate: OpenRouter first, Gemini as the safety net."""
+    """providers.vision_generate: one provider first, the other as a safety net,
+    in whichever order VISION_PROVIDER sets."""
+
+    def test_gemini_first_falls_back_to_openrouter(self):
+        """On paid credits the default is gemini-first, but the free models
+        remain a genuine fallback if the whole Gemini chain is down."""
+        import providers
+
+        with mock.patch.object(config, "OPENROUTER_API_KEY", "k"), \
+             mock.patch.object(config, "VISION_PROVIDER", "gemini"), \
+             mock.patch.object(providers.gemini_client, "generate_content",
+                               side_effect=gcc.AllModelsUnavailable("down")), \
+             mock.patch.object(providers.openrouter_client, "generate_content",
+                               return_value=mock.Mock(text="openrouter")) as orx:
+            self.assertEqual(providers.vision_generate(["x"]).text, "openrouter")
+        orx.assert_called_once()
+
+    def test_gemini_first_with_no_openrouter_key_never_calls_it(self):
+        import providers
+
+        with mock.patch.object(config, "OPENROUTER_API_KEY", ""), \
+             mock.patch.object(config, "VISION_PROVIDER", "gemini"), \
+             mock.patch.object(providers.openrouter_client, "generate_content") as orx, \
+             mock.patch.object(providers.gemini_client, "generate_content",
+                               return_value=mock.Mock(text="g")):
+            self.assertEqual(providers.vision_generate(["x"]).text, "g")
+        orx.assert_not_called()
 
     def test_falls_back_to_gemini_when_openrouter_is_exhausted(self):
         import providers

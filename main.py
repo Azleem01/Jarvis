@@ -27,6 +27,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pyautogui
@@ -37,6 +38,7 @@ import cancellation
 import config
 import overlay as overlay_mod
 import providers
+import self_restart
 import speaker_mute
 from llm_agent import JarvisAgent
 from stt_engine import Recorder, Transcriber
@@ -89,6 +91,41 @@ _VK_CAPITAL = 0x14
 # Below this peak amplitude a take is effectively silence — almost always a
 # muted mic or the wrong input device rather than a quiet speaker.
 _SILENCE_PEAK = 0.002
+
+# How close to a screen corner the cursor must get to count as "slammed into"
+# it — the whole-task cancel gesture. Small, so ordinary mousing near an edge
+# doesn't trigger it; you have to actually drive into the corner. This mirrors
+# pyautogui's own FAILSAFE corners (which only abort a pyautogui action), but
+# applies to the whole command, at any time, not just during a click.
+_CORNER_PX = 8
+# How often the corner watcher samples the cursor while a command is in flight.
+_CORNER_POLL_S = 0.05
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _cursor_pos() -> "tuple[int, int]":
+    pt = _POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def _screen_size() -> "tuple[int, int]":
+    u = ctypes.windll.user32
+    return u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+
+
+def _in_corner(x: int, y: int, w: int, h: int, margin: int = _CORNER_PX) -> bool:
+    """True when (x, y) sits in any corner box of a w×h screen.
+
+    A corner needs *both* axes at an extreme — parking at the middle of an edge
+    (which normal mousing does constantly) is not a corner and must not cancel.
+    """
+    near_x = x <= margin or x >= w - 1 - margin
+    near_y = y <= margin or y >= h - 1 - margin
+    return near_x and near_y
 
 
 def _caps_is_on() -> bool:
@@ -182,9 +219,8 @@ class Jarvis:
         # Esc in that window repainted "Cancelling…" over a finished reply, with
         # no worker left to clear it — the stuck-"thinking" symptom again.
         if key == keyboard.Key.esc and self._working.is_set():
-            cancellation.request_cancel()
             print("[Azleem] Esc pressed — cancelling the current task...")
-            self.hud.set_state("thinking", "Cancelling…")
+            self._cancel_current()
             return
         if not _USE_CAPS and key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
             self._ctrl_down = True
@@ -319,40 +355,158 @@ class Jarvis:
         return key == keyboard.Key.space
 
     # -- command pipeline ----------------------------------------------------
+    def _begin_worker(self) -> int:
+        """Stamp this worker's generation and arm cancellation for the command.
+
+        Enables Esc/corner cancel for the WHOLE command, transcription included —
+        a slow Whisper decode used to ignore Esc entirely because _working wasn't
+        set until after it. The corner watcher runs alongside.
+        """
+        with self._state:
+            self._active_seq += 1
+            self._local.seq = self._active_seq
+            seq = self._active_seq
+        cancellation.reset()
+        self._working.set()
+        self._start_corner_watch(seq)
+        return seq
+
+    def _answer(self, text: str) -> None:
+        """Route text through the agent and deliver the reply, honouring cancel."""
+        self.hud.set_state("thinking", f"“{text}”")
+        try:
+            reply = self.agent.handle(text)
+        finally:
+            # Cleared before the reply goes out, so an Esc arriving after this
+            # point is treated as an idle Esc rather than repainting over a
+            # reply nothing will clear.
+            self._working.clear()
+
+        print(f"[Azleem] {reply}")
+        # If this worker was abandoned (Esc or a corner hit bumped the
+        # generation), _cancel_current has already shown "Cancelled." — the late
+        # result must not repaint over it. Same staleness guard _report_progress
+        # uses, applied to the final reply.
+        if self._is_stale():
+            print("[Azleem] worker result discarded (command was cancelled).")
+        elif cancellation.cancelled():
+            self.hud.show_reply("Cancelled.")
+        else:
+            self.hud.show_reply(reply or "Done.")
+
     def _process(self, audio) -> None:  # noqa: ANN001
         # _busy is already held by _on_release, which claimed the slot before
         # the HUD was switched to "thinking"; this thread only has to release it.
         try:
-            with self._state:
-                self._active_seq += 1
-                self._local.seq = self._active_seq
-            cancellation.reset()
+            self._begin_worker()
             text = self.transcriber.transcribe(audio)
+            if self._is_stale():
+                print("[Azleem] cancelled during transcription; discarding.")
+                return
             if not text:
                 print("[Azleem] (heard nothing)")
                 self.hud.show_reply("I didn't catch that.")
                 return
             print(f"[you] {text}")
-            self.hud.set_state("thinking", f"“{text}”")
-            self._working.set()
-            try:
-                reply = self.agent.handle(text)
-            finally:
-                # Cleared before the reply goes out, so an Esc arriving after
-                # this point is treated as an idle Esc rather than repainting
-                # "Cancelling…" over a reply nothing will clear.
-                self._working.clear()
-            print(f"[Azleem] {reply}")
-            if cancellation.cancelled():
-                self.hud.show_reply("Cancelled.")
-            else:
-                self.hud.show_reply(reply or "Done.")
+            self._answer(text)
         except Exception as exc:  # keep the loop alive no matter what
             print(f"[Azleem] error: {exc}")
-            self.hud.show_reply(f"Something went wrong: {exc}")
+            if not self._is_stale():
+                self.hud.show_reply(f"Something went wrong: {exc}")
         finally:
             self._working.clear()   # belt and braces if we left early
             self._busy.release()
+
+    def _process_text(self, text: str) -> None:
+        """Worker for a command that arrived as text, not audio.
+
+        Used for the request Azleem restarted to fulfil after add_capability —
+        the transcription step is skipped, everything else matches _process.
+        """
+        try:
+            self._begin_worker()
+            print(f"[you] {text}")
+            self._answer(text)
+        except Exception as exc:
+            print(f"[Azleem] error: {exc}")
+            if not self._is_stale():
+                self.hud.show_reply(f"Something went wrong: {exc}")
+        finally:
+            self._working.clear()
+            self._busy.release()
+
+    def dispatch_pending(self) -> None:
+        """Run a command left behind by a self-extension restart, if any is fresh.
+
+        add_capability writes the user's original request before it restarts, so
+        the freshly installed tool can carry it out immediately. One shot: the
+        pending file is consumed on read.
+        """
+        try:
+            text = self_restart.take_pending()
+        except Exception as exc:  # a bad pending file must never block startup
+            print(f"[Azleem] could not read the pending command: {exc}")
+            return
+        if not text:
+            return
+        print(f"[Azleem] running the request I restarted for: {text!r}")
+        if not self._busy.acquire(blocking=False):
+            return  # something is already running; drop it rather than queue
+        self.hud.show()
+        threading.Thread(target=self._process_text, args=(text,), daemon=True).start()
+
+    # -- cancellation --------------------------------------------------------
+    def _is_stale(self) -> bool:
+        """True if this worker's command has been abandoned (generation moved on).
+
+        Runs on the worker thread, so its own generation lives in thread-local
+        storage. _cancel_current bumps _active_seq, which is what makes a
+        cancelled worker's remaining output stale.
+        """
+        return getattr(self._local, "seq", None) != self._active_seq
+
+    def _cancel_current(self, reason: str = "Cancelled.") -> None:
+        """Abort the in-flight command's UI at once and mark its worker stale.
+
+        The worker thread can't be killed and its blocking call can't be
+        interrupted, so this doesn't try. Instead it makes the *experience*
+        instant: bump the generation so the worker's late progress and final
+        reply are ignored, drop the terminal reply on the HUD now, and let the
+        orphaned worker unwind on its own (the shortened request timeout and the
+        cancel checks in gemini_client/quiz/computer_use free its _busy slot
+        within a few seconds). Shared by the Esc key and the corner watcher.
+        """
+        if not self._working.is_set():
+            return  # nothing genuinely in flight — treat as an idle gesture
+        cancellation.request_cancel()
+        with self._state:
+            self._active_seq += 1   # every current worker is now stale
+        self._working.clear()       # a second Esc is idle, not another repaint
+        self.hud.show_reply(reason)
+
+    def _start_corner_watch(self, seq: int) -> None:
+        """Watch for the cursor hitting a screen corner, only while this command runs."""
+        threading.Thread(
+            target=self._watch_corners, args=(seq,), daemon=True
+        ).start()
+
+    def _watch_corners(self, seq: int) -> None:
+        try:
+            w, h = _screen_size()
+        except Exception:
+            return  # no usable metrics — Esc still cancels
+        # Poll only while THIS command is the active one and still in flight, so
+        # the watcher is free at idle and never blocks the listener thread.
+        while self._active_seq == seq and self._working.is_set():
+            try:
+                x, y = _cursor_pos()
+            except Exception:
+                return
+            if _in_corner(x, y, w, h):
+                print("[Azleem] cursor hit a screen corner — cancelling.")
+                self._cancel_current()
+                return
+            time.sleep(_CORNER_POLL_S)
 
     # -- lifecycle -----------------------------------------------------------
     def start_listener(self) -> keyboard.Listener:
@@ -378,8 +532,8 @@ class Jarvis:
             print(f"  A quick tap under {hold:g}s is ignored (Caps Lock still works).")
         print(f"  {providers.describe()}")
         print("  Speakers mute while listening, so it only hears you.")
-        print("  Move mouse to a screen corner to abort a click.")
-        print("  Press Esc to cancel a running task.")
+        print("  Press Esc — or shove the cursor into a screen corner — to")
+        print("  cancel a running task; the HUD slides aside if you near it.")
         if _HEADLESS:
             print("  Running in the background (auto-start). Quit via Task")
             print("  Manager: end the pythonw.exe running main.py.")
@@ -530,6 +684,9 @@ def main() -> None:
     def on_ready() -> None:
         jarvis.start_listener()
         jarvis.banner()
+        # If this start was triggered by add_capability, run the request that
+        # caused it, now that the new tool is loaded.
+        jarvis.dispatch_pending()
 
     def shutdown(_sig=None, _frame=None) -> None:  # noqa: ANN001
         print("\n[Azleem] shutting down. Goodbye.")

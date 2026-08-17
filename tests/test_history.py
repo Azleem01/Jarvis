@@ -49,8 +49,10 @@ class HistoryTestCase(unittest.TestCase):
 
 class TestFollowUps(HistoryTestCase):
     def test_the_first_command_carries_no_history(self):
-        self.agent.handle("what is on my screen")
-        self.assertEqual(_texts(self.sent()), ["what is on my screen"])
+        # A command that goes to the model (not one intents fast-paths, which
+        # would make no request at all — "what is on my screen" now does).
+        self.agent.handle("tell me a joke")
+        self.assertEqual(_texts(self.sent()), ["tell me a joke"])
 
     def test_the_second_command_carries_the_first_turn(self):
         self.reply("Opened the site.")

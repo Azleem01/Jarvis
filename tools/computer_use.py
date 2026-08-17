@@ -233,6 +233,11 @@ def perform_computer_task(task: str) -> str:
             )
 
         _progress(f"Step {step}/{_MAX_STEPS}: {reason or action}")
+        # A cancel that arrived while the (blocking) vision call was in flight
+        # must stop us BEFORE we perform the action — otherwise Esc/corner still
+        # lands one more click. The top-of-loop check only covers between steps.
+        if cancellation.cancelled():
+            return _report("Aborted — you cancelled.", history)
         try:
             outcome = _execute(action, data, image.size)
         except pyautogui.FailSafeException:

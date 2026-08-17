@@ -36,7 +36,7 @@ def _model_facing_prompts():
     as the rest: it biases the decoder, so a brand there would be *transcribed*
     into the user's commands.
     """
-    from tools import coding, quiz, vision_tools
+    from tools import coding, quiz, self_extend, vision_tools
     import stt_engine
 
     return {
@@ -44,6 +44,8 @@ def _model_facing_prompts():
         "computer_use._AGENT_PROMPT": computer_use._AGENT_PROMPT,
         "coding._CODE_PROMPT": coding._CODE_PROMPT,
         "coding._REPAIR_PROMPT": coding._REPAIR_PROMPT,
+        "coding._ACTION_PROMPT": coding._ACTION_PROMPT,
+        "self_extend._TOOL_PROMPT": self_extend._TOOL_PROMPT,
         "vision_tools._VISION_PROMPT": vision_tools._VISION_PROMPT,
         "vision_tools._READ_PROMPT": vision_tools._READ_PROMPT,
         "quiz._QUIZ_PROMPT": quiz._QUIZ_PROMPT,
@@ -285,11 +287,13 @@ class TestToolSchemas(unittest.TestCase):
         """Catch the import itself, not just its downstream symptom.
 
         Matched per-line so the modules' own prose warnings against this import
-        don't trip the check.
+        don't trip the check. tools/generated/ is included: a tool Azleem writes
+        for itself is subject to exactly the same trap as a hand-written one.
         """
         import pathlib
         tools_dir = pathlib.Path(computer_use.__file__).parent
-        for path in tools_dir.glob("*.py"):
+        paths = list(tools_dir.glob("*.py")) + list((tools_dir / "generated").glob("*.py"))
+        for path in paths:
             with self.subTest(module=path.name):
                 offenders = [
                     n for n, line in enumerate(
@@ -312,6 +316,52 @@ class TestToolSchemas(unittest.TestCase):
         self.assertEqual(props, {"url", "browser", "search_query"})
         # Only the address is mandatory: "open youtube" must be a valid call.
         self.assertEqual(list(decl.parameters.required or []), ["url"])
+
+
+class TestSelfExtension(unittest.TestCase):
+    """add_capability writes tools into tools/generated/. Whatever is loaded
+    there must clear the same bars a hand-written tool does — this test is also
+    the gate add_capability runs before it installs a new tool and restarts.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from google.genai import Client
+        cls.client = Client(api_key="schema-only-not-a-real-key")._api_client
+
+    def _declare(self, fn):
+        from google.genai import types
+        return types.FunctionDeclaration.from_callable(callable=fn, client=self.client)
+
+    def test_add_capability_is_registered(self):
+        names = [f.__name__ for f in llm_agent._TOOLS]
+        self.assertIn("add_capability", names)
+
+    def test_add_capability_is_confirm_gated_in_the_prompt(self):
+        """The routing bullet must tell the model to confirm before installing —
+        without it, a mis-transcription could rewrite the codebase unprompted."""
+        system = llm_agent._SYSTEM_PROMPT.lower()
+        self.assertIn("- add_capability:", system)
+        bullet = system.split("- add_capability:", 1)[1][:400]
+        self.assertIn("confirm", bullet)
+
+    def test_generated_tools_declare_cleanly(self):
+        """Every self-written tool that loaded must build a valid declaration."""
+        import tools.generated as generated
+        for fn in getattr(generated, "TOOLS", []):
+            with self.subTest(tool=getattr(fn, "__name__", "?")):
+                decl = self._declare(fn)
+                self.assertTrue(
+                    (decl.description or "").strip(),
+                    f"{fn.__name__} has no description — Gemini routes on it.",
+                )
+
+    def test_generated_tool_docstrings_name_no_creators(self):
+        import tools.generated as generated
+        for fn in getattr(generated, "TOOLS", []):
+            doc = (inspect.getdoc(fn) or "").lower()
+            for name in _FORBIDDEN_NAMES:
+                self.assertNotIn(name, doc, f"generated tool '{fn.__name__}' names '{name}'.")
 
 
 class TestBuildFingerprint(unittest.TestCase):

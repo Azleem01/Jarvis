@@ -24,10 +24,11 @@ from typing import Callable
 
 from google.genai import types
 
+import cancellation
 import config
 import gemini_client
 import intents
-from tools.coding import solve_with_python
+from tools.coding import accomplish_with_code, solve_with_python
 from tools.computer_use import perform_computer_task
 from tools.os_tools import (
     open_application,
@@ -42,6 +43,7 @@ from tools.productivity import (
     write_note,
 )
 from tools.quiz import answer_quiz
+from tools.self_extend import add_capability
 from tools.system import (
     control_volume,
     power_action,
@@ -50,6 +52,15 @@ from tools.system import (
 )
 from tools.vision_tools import execute_screen_task, read_screen
 from tools.windows import arrange_window, focus_window
+
+# Tools Azleem has written for itself live in their own isolated package, loaded
+# behind a guard: a broken generated tool must degrade to "no extra tools", never
+# stop the assistant from starting. See tools/self_extend.py.
+try:
+    import tools.generated as _generated
+except Exception as _gen_exc:  # pragma: no cover - defensive
+    print(f"[llm] generated tools unavailable: {_gen_exc}")
+    _generated = None
 
 _SYSTEM_PROMPT = (
     "You are Azleem, a concise Windows desktop assistant. The user speaks a "
@@ -86,6 +97,21 @@ _SYSTEM_PROMPT = (
     "- solve_with_python: computational or programmatic tasks — maths, data "
     "generation, text processing ('compute the first 100 primes'). Returns a "
     "shareable solution link when available.\n"
+    "- accomplish_with_code: the LAST RESORT, only when no other tool above "
+    "fits. It writes and runs a fresh Python program to do something none of "
+    "the dedicated tools cover, and that program may act on the system. Never "
+    "use it for anything another tool already handles (launching apps, opening "
+    "sites, reading the screen, quizzes, files, messages, volume, brightness, "
+    "alarms, notes, windows) — reach for it only when the request genuinely has "
+    "no dedicated tool.\n"
+    "- add_capability: ONLY when the user wants a genuinely missing capability "
+    "added for good ('learn to …', 'you should be able to …', a request nothing "
+    "here covers that they want to keep). It writes a new tool into Azleem's own "
+    "code and restarts to load it, so — like power_action — it is confirmed out "
+    "loud: call it WITHOUT confirm first to write and describe the tool, and only "
+    "pass confirm=true when the user has just said 'confirm'. For a one-off, use "
+    "accomplish_with_code instead; never use this to repeat something a tool "
+    "already does.\n"
     "- read_screen: read text off the screen (an exercise statement, a "
     "question, an error) so you can pass it to another tool.\n"
     "- answer_quiz: ANY multiple-choice quiz, test or question set on screen — "
@@ -145,6 +171,8 @@ _TOOLS: list[Callable[..., str]] = [
     add_calendar_event,
     write_note,
     solve_with_python,
+    accomplish_with_code,
+    add_capability,
     control_volume,
     set_brightness,
     system_status,
@@ -326,8 +354,14 @@ class JarvisAgent:
         # cannot be converted for set_alarm / add_calendar_event.
         now = datetime.datetime.now().strftime("%A %Y-%m-%d %H:%M")
         gen_config = types.GenerateContentConfig(
-            system_instruction=f"{_SYSTEM_PROMPT}\nCurrent date and time: {now}.",
-            tools=[_tracked(fn, performed) for fn in _TOOLS],
+            system_instruction=(
+                f"{_SYSTEM_PROMPT}{_generated_routing()}\n"
+                f"Current date and time: {now}."
+            ),
+            tools=[
+                _tracked(fn, performed)
+                for fn in _TOOLS + _generated_tools()
+            ],
             temperature=0.2,
         )
 
@@ -345,6 +379,12 @@ class JarvisAgent:
                 gen_config=gen_config,
                 on_attempt_failed=keep_falling_back,
             )
+        except cancellation.Cancelled:
+            # The user pressed Esc / hit a corner mid-routing. Report any work
+            # that already ran, but record nothing — a cancelled turn is not an
+            # antecedent a follow-up should be able to refer back to.
+            print("[llm] cancelled during routing.")
+            return _with_actions("Cancelled.", performed)
         except gemini_client.NetworkUnavailable as exc:
             print(f"[llm] network unavailable: {exc}")
             return _with_actions(
@@ -411,6 +451,16 @@ class JarvisAgent:
             # Falling through costs a round trip but always beats failing.
             print(f"[llm] fast path failed ({exc}); handing to the model.")
             return None
+
+
+def _generated_tools() -> "list[Callable[..., str]]":
+    """The self-written tools, re-read each call so a restart isn't required to
+    *forget* one that was deleted — though adding one still needs the reload."""
+    return list(getattr(_generated, "TOOLS", []) or [])
+
+
+def _generated_routing() -> str:
+    return getattr(_generated, "ROUTING", "") or ""
 
 
 def _tool_by_name(name: str):
