@@ -13,9 +13,13 @@ The agent is built with ``__new__`` here, as elsewhere in these tests, so no
 real router is constructed.
 """
 
+import json
 import os
 import sys
+import tempfile
+import time
 import unittest
+from collections import deque
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -187,6 +191,50 @@ class TestHistoryIsOptional(unittest.TestCase):
             agent.handle("second")
         contents = agent.router.generate_content.call_args.kwargs["contents"]
         self.assertEqual(_texts(contents), ["second"])
+
+
+class TestPersistenceAcrossRestart(unittest.TestCase):
+    """History is written to disk so it survives Azleem restarting itself."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        self.path = path
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+    def _agent(self):
+        agent = llm_agent.JarvisAgent.__new__(llm_agent.JarvisAgent)
+        agent.router = mock.Mock()
+        agent.router.generate_content.return_value = mock.Mock(text="ok")
+        agent._history = deque(maxlen=max(1, config.HISTORY_TURNS) * 2)
+        agent._last_turn_at = 0.0
+        agent._history_file = self.path
+        return agent
+
+    def test_a_turn_is_saved_and_reloads_into_a_new_agent(self):
+        a = self._agent()
+        a.handle("tell me a joke")  # goes to the (mocked) model, then persists
+        b = self._agent()
+        b._load_history()
+        self.assertIn("tell me a joke", _texts(list(b._hist)))
+
+    def test_stale_history_is_dropped_on_load(self):
+        a = self._agent()
+        a.handle("tell me a joke")
+        with open(self.path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["saved_at"] = time.time() - config.HISTORY_IDLE_SECONDS - 10
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        b = self._agent()
+        b._load_history()
+        self.assertEqual(list(b._hist), [])
+
+    def test_a_new_agent_with_no_file_starts_empty(self):
+        b = self._agent()
+        b._load_history()  # file does not exist yet
+        self.assertEqual(list(b._hist), [])
 
 
 class TestSystemPromptGuardsAgainstReplay(unittest.TestCase):

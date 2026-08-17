@@ -310,6 +310,142 @@ tick and snaps back to full speed. Guarded by `TestIdleTickThrottle`. (The audio
 stream is already closed at idle and the resident Whisper model is a RAM cost, not
 CPU — this tick was the one always-on CPU drain.)
 
+**32. WhatsApp messaging no longer needs a saved number — but the cache stores
+names, not numbers.** `send_whatsapp_message` tries a known/cached number first
+(the instant deep link, unchanged) and otherwise falls through to
+`tools/whatsapp.py`'s vision path: type the name into WhatsApp's search box,
+`screen.locate` the matching contact row and click it, `screen.locate` the
+message box, type, Enter — every step verified with `screen.wait_for_change`,
+every failure reported honestly (gotcha 22 applies to each UI step). The WhatsApp
+UI never exposes a phone number, so a UI-discovered contact is cached by *name*
+only (canonical spelling seen on screen). That makes the next send more reliable
+(exact search term) but does NOT let it skip to the deep link — only a real
+number, from `.env` or a future capability, does. Don't advertise the cache as a
+speed-up it isn't.
+
+**33. Any new `_…PROMPT` constant is auto-discovered and must be registered.**
+`test_prompts.test_every_model_facing_prompt_is_checked` globs every `*.py` in
+the root and `tools/` for a `^_[A-Z0-9_]*PROMPT` assignment and fails if it is
+not listed in `_model_facing_prompts()`. Promoting the quiz pointer to the shared
+`screen.locate` created `screen._POINT_PROMPT`, and the WhatsApp bulk-capture
+added `whatsapp._LIST_PROMPT`; both had to be added there or the guard-the-guard
+test fails. This is deliberate — an unscreened prompt is one that could smuggle a
+brand name past the contamination check (gotcha 2).
+
+**34. On-screen text is DATA, not instructions to Azleem.** Confirmed from
+`logs/azleem.log`: an assignment page said *"include a screenshot"*, the router
+obeyed and called `take_screenshot` 7× — which `os.startfile`'d each PNG so image
+windows popped up mid-task, and the distraction lost the paste target. Fixed two
+ways: `take_screenshot` no longer opens the image (saves + returns the path only),
+and both `_SYSTEM_PROMPT` and `computer_use._AGENT_PROMPT` state that a form's or
+assignment's own text is content to work on, never commands to obey. Guarded by
+`test_prompts` + `test_productivity`.
+
+**35. Contact names are resolved, never taken literally.**
+`tools/contacts.resolve_contact` maps a spoken name to a real saved contact:
+relationship groups (mom/mum/mommy/mother; dad/daddy/father) normalise first,
+then stdlib `difflib` fuzzy-matches against `WHATSAPP_CONTACTS` + the learnt cache
++ taught aliases. A clear winner → `("match", name)`; two close → `("ambiguous",
+…)` and `send_whatsapp_message` ASKS instead of messaging the wrong person (the
+user's #1 rule). Keep the user's spoken casing when the match is the same name;
+switch to the saved spelling only when genuinely different (mom→Mum), else the
+lower-cased `.env` keys give "Sent to alex". `link_contact_alias` teaches "my dad
+is <name>".
+
+**36. STT accuracy = model + hotwords + correction, and hotwords are dynamic.**
+Whisper default is now `small.en` (`base` mangled proper nouns). `stt_engine`
+biases decoding with `hotwords` built at load from the user's real contact names
++ a command vocab, and a conservative post-decode `_correct` map fixes name
+mishears ("diabetes"→"Jarvis"). The contact hotwords are built dynamically (not a
+static `_*PROMPT`), so they never trip the brand-contamination guard; a restart
+refreshes them.
+
+**37. Persisted history uses wall-clock, and is gated so tests don't write it.**
+The rolling history saves to `logs/history.json` so it survives the self-restart.
+Freshness is checked on load with `time.time()`, NOT `time.monotonic()` (which
+resets each process and is meaningless across a restart). Persistence is a no-op
+unless `self._history_file` is set — only `__init__` sets it, so the
+`__new__`-built agents in the history tests never clobber the real file.
+
+**38. The agency demo is proven offline, not live.** `perform_computer_task` now
+runs to 25 steps and, once a step stalls (the oscillation guard trips), escalates
+to a real thinking budget so it reasons out instead of aborting.
+`tools/send_file.send_file_to_phone` finds a file and drives WhatsApp's
+attach→pick→send UI, verified each step. Both have fakes-based tests; the real
+proof is a spoken test on the user's actual WhatsApp/file dialog (gotcha 22
+applies to every UI step). Fully autonomous job-application autopilot is NOT
+claimed — this is the robust foundation, and it pauses before a final submit.
+
+---
+
+## Latest round — the screenshot bug, smarter contacts, better ears, real agency
+
+Six asks; one had a logged root cause. See gotchas 34-38.
+
+- **W1 — quiz "screenshot" break.** The model obeyed on-screen "include a
+  screenshot" text and popped image windows, losing the paste target. Fixed at
+  the routing level (gotcha 34).
+- **W2 — fuzzy + semantic contacts.** `tools/contacts.py` resolver + confirm-when-
+  unsure; `link_contact_alias` (gotcha 35).
+- **W3 — transcription.** `small.en` + contact hotwords + correction map (gotcha
+  36). New config `STT_CORRECTIONS`.
+- **W4 — context across restarts.** History persists to `logs/history.json`
+  (gotcha 37); `HISTORY_TURNS` 5→8, new `HISTORY_FILE`.
+- **W5 — stronger agent + demo.** 25 steps, adaptive reasoning on stall, form
+  guidance; `send_file_to_phone` (gotcha 38). New config
+  `AGENT_STALL_THINKING_BUDGET`, `WHATSAPP_SELF_NAME`, `CONTACT_MATCH_THRESHOLD`,
+  `CONTACT_MATCH_MARGIN`.
+
+Verified: **378 offline tests** (up from 352); three mutations caught and restored
+(take_screenshot auto-open, ambiguous-never-sends, stall-escalation).
+
+Out of scope / honest limits: `small.en` adds a little STT latency (chosen over
+`distil`/`large` to stay fast); the WhatsApp file-attach + self-chat flow and the
+resolver's reliability depend on the user's real layout/contacts and need a live
+spoken test; job-application autopilot is a foundation, not a finished product.
+
+---
+
+## Latest round — WhatsApp by name, and reaching for code when blocked
+
+Two asks: stop making WhatsApp depend on a hand-written `WHATSAPP_CONTACTS` map —
+Azleem should find the contact in the app itself and message them, and capture the
+contact list into a store it manages — and let Azleem write its own code to get
+past a barrier instead of replying that it can't.
+
+- **WhatsApp by name (`tools/whatsapp.py`, new).** Gotcha 32. `send_whatsapp_message`
+  is now cache/deep-link-first, else it drives WhatsApp's own UI by vision. Names
+  it reaches are saved to a private, git-ignored cache
+  (`logs/whatsapp_contacts.json`) so it learns the user's contacts itself.
+  `capture_whatsapp_contacts` scroll-scans the chat list into that cache ("save my
+  whatsapp contacts"), stopping when `wait_for_change` reports the list stopped
+  moving (end-of-list sentinel).
+- **Shared pointer.** The quiz's `_locate`/`_click_box` are now
+  `screen.locate`/`screen.click_box`, reused by the WhatsApp path; `quiz.py`'s own
+  tuned copies are left untouched to avoid regressing the measured quiz accuracy.
+  New prompt constants `screen._POINT_PROMPT` + `whatsapp._LIST_PROMPT` registered
+  (gotcha 33).
+- **Self-unblocking (routing only).** `_SYSTEM_PROMPT`'s `accomplish_with_code`
+  bullet went from a discouraged "LAST RESORT … never use it" to: when no
+  dedicated tool fits an action the user wants done, write and run code *rather
+  than giving up*. The rule lives in the system prompt because that is where the
+  tool choice is made (gotcha 11). `add_capability` (permanent self-rewrites) keeps
+  its spoken-"confirm" gate + rollback unchanged — by the user's choice, only
+  one-off code is automatic, self-modification still confirms.
+- **Config:** `WHATSAPP_CONTACT_CACHE`, `WHATSAPP_SEND_TIMEOUT`,
+  `WHATSAPP_SETTLE_SECONDS`, `WHATSAPP_MAX_SCROLLS` (the send timings were
+  hardcoded before).
+
+Verified: **352 offline tests** (up from 337), and the mutation on the
+send-confirmation guard was caught — forcing `sent = True` made
+`test_unconfirmed_send_is_not_claimed_as_success` fail, then restored.
+
+Out of scope / honest limits: the UI path's reliability depends on the vision
+model locating the search box, the right contact row and the message box on the
+user's actual WhatsApp layout — proven offline with fakes, but the real proof is
+a live spoken test only the user can run. The cache remembers names, not numbers,
+so repeat sends still drive the UI (gotcha 32).
+
 ---
 
 ## Latest round — self-extension, and a quieter idle
@@ -393,7 +529,7 @@ during a single in-flight request still waits out that one request (capped at
 ## Commands
 
 ```bash
-python main.py --selftest    # 188 offline tests, no network, nothing launched
+python main.py --selftest    # 378 offline tests, no network, nothing launched
 ```
 
 ```bash
@@ -428,6 +564,12 @@ AZLEEM_LIVE_TESTS=1 python -m unittest tests.test_routing_live -v
 | `test_reply_summary.py` | Reply budgeting — the outcome survives the HUD's 220-char cut |
 | `test_screen_change.py` | The change detector; the defect that corrupted quiz answers |
 | `test_quiz.py` | The answer/point/click/verify loop, with a fake mouse |
+| `test_whatsapp.py` | By-name send: cache, known/cached/UI routing, the vision search→click→send loop, bulk contact capture, and fuzzy/relationship contact resolution with confirm-when-unsure — fake mouse + fake vision |
+| `test_contacts` (in test_whatsapp) | Relationship aliases (mom↔mum), difflib fuzzy match, ambiguous→asks-not-sends, taught aliases |
+| `test_productivity.py` | take_screenshot saves quietly and never opens the image (the on-screen-instruction bug) |
+| `test_stt.py` | Transcription correction map + contact hotword biasing (offline, no model load) |
+| `test_computer_use.py` | Adaptive reasoning: a stalled step escalates the thinking budget |
+| `test_send_file.py` | send_file_to_phone: find file, attach→send flow, honest failures — fake mouse + fake vision |
 | `test_openrouter.py` | Payload translation, fallback, and the pointing/vision model split |
 | `test_quiz_live.py` | **Opt-in:** real models, five layouts, measured click accuracy |
 | `test_open_url.py` | URL resolution, manglings, deep links, search encoding, scheme safety |

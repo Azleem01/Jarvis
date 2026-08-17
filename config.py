@@ -132,7 +132,15 @@ HISTORY_IDLE_SECONDS: float = max(0.0, float(_get("HISTORY_IDLE_SECONDS", "180")
 # Conversation turns (a command plus its reply) kept for context. Deliberately
 # small: a long transcript costs tokens on every request and gives the router
 # more chances to act on something the user has already moved on from.
-HISTORY_TURNS: int = max(0, int(_get("HISTORY_TURNS", "5")))
+HISTORY_TURNS: int = max(0, int(_get("HISTORY_TURNS", "8")))
+
+# Where the rolling history is persisted so it survives a restart (Azleem
+# restarts itself for self-extension). Reloaded on startup only if still inside
+# HISTORY_IDLE_SECONDS, so a restart hours later still starts fresh. Git-ignored
+# under logs/.
+HISTORY_FILE: Path = Path(
+    _get("HISTORY_FILE", str(Path(__file__).resolve().parent / "logs" / "history.json"))
+)
 
 # ---- GitHub (optional) -----------------------------------------------------
 # Personal access token with the "gist" scope. When set, solve_with_python
@@ -157,9 +165,18 @@ SHOW_OVERLAY: bool = _get("SHOW_OVERLAY", "true").strip().lower() not in (
 )
 
 # ---- Speech-to-text (faster-whisper) ---------------------------------------
-WHISPER_MODEL: str = _get("WHISPER_MODEL", "base")
+# Default is 'small.en': a large accuracy jump over 'base' on proper nouns like
+# 'Jarvis' and contact names, still fine on CPU/int8. 'language' is fixed to
+# English below, so the '.en' variant is the right one. For maximum accuracy set
+# 'distil-large-v3' (bigger download + more RAM); for maximum speed, 'base.en'.
+WHISPER_MODEL: str = _get("WHISPER_MODEL", "small.en")
 WHISPER_DEVICE: str = _get("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE: str = _get("WHISPER_COMPUTE_TYPE", "int8")
+
+# Optional JSON map of transcription mishears -> corrections, applied after
+# decoding (merged with a small built-in set for the assistant's own name, e.g.
+# 'diabetes' -> 'Jarvis'). Example: {"travis":"Jarvis","javis":"Jarvis"}
+STT_CORRECTIONS: str = _get("STT_CORRECTIONS", "")
 
 # Beam width for Whisper decoding. Measured on real speech (tests/bench.py),
 # 1 (greedy) is about 10% faster than 5 with identical transcription on short
@@ -176,9 +193,10 @@ SAMPLE_RATE: int = 16000
 # too high and every step pays for it.
 AGENT_SETTLE_SECONDS: float = float(_get("AGENT_SETTLE_SECONDS", "0.45"))
 
-# Hard cap on actions in one computer-use task, so a confused agent surfaces a
-# partial result quickly instead of grinding.
-AGENT_MAX_STEPS: int = max(1, int(_get("AGENT_MAX_STEPS", "12")))
+# Hard cap on actions in one computer-use task. Raised to 25 so genuinely
+# multi-step flows (multi-page forms, job applications) can finish; a confused
+# agent is still bounded by the oscillation guard long before this.
+AGENT_MAX_STEPS: int = max(1, int(_get("AGENT_MAX_STEPS", "25")))
 
 # Thinking tokens the model may spend on a single click/type decision. 0 keeps
 # per-step latency down and is right for "click the blue button" — but it is
@@ -186,6 +204,12 @@ AGENT_MAX_STEPS: int = max(1, int(_get("AGENT_MAX_STEPS", "12")))
 # tool rather than riding the computer-use loop. Raise if the agent starts
 # making poor decisions on complex screens.
 AGENT_THINKING_BUDGET: int = max(0, int(_get("AGENT_THINKING_BUDGET", "0")))
+
+# Thinking budget the loop escalates to once a step has visibly stalled (the
+# oscillation guard trips). The common path stays at AGENT_THINKING_BUDGET for
+# speed; only when the agent is stuck does it "stop and think" its way out
+# instead of aborting. 0 disables the escalation.
+AGENT_STALL_THINKING_BUDGET: int = max(0, int(_get("AGENT_STALL_THINKING_BUDGET", "1024")))
 
 # ---- File search -----------------------------------------------------------
 def _downloads_dir() -> Path:
@@ -212,6 +236,38 @@ def _load_contacts() -> dict[str, str]:
 
 
 WHATSAPP_CONTACTS: dict[str, str] = _load_contacts()
+
+# Local cache of contacts Azleem discovers itself while messaging by name (the
+# canonical spelling it saw on screen, plus any number it already knows). Lives
+# under logs/ (git-ignored) so the user's contacts stay private and out of
+# version control. Purely additive — it never overwrites WHATSAPP_CONTACTS.
+WHATSAPP_CONTACT_CACHE: Path = Path(
+    _get(
+        "WHATSAPP_CONTACT_CACHE",
+        str(Path(__file__).resolve().parent / "logs" / "whatsapp_contacts.json"),
+    )
+)
+
+# Timings for the WhatsApp send path (previously hardcoded inside the tool).
+# SEND_TIMEOUT: how long to wait for the app window to come to the front.
+# SETTLE_SECONDS: the pause that lets the chat / message box populate before
+# typing or pressing Enter. MAX_SCROLLS caps capture_whatsapp_contacts so a
+# runaway list can never scroll forever.
+WHATSAPP_SEND_TIMEOUT: float = float(_get("WHATSAPP_SEND_TIMEOUT", "8.0"))
+WHATSAPP_SETTLE_SECONDS: float = float(_get("WHATSAPP_SETTLE_SECONDS", "0.6"))
+WHATSAPP_MAX_SCROLLS: int = int(_get("WHATSAPP_MAX_SCROLLS", "40"))
+
+# Fuzzy contact matching (tools/contacts.py). THRESHOLD is difflib's cutoff for
+# calling a name "close"; MARGIN is how far ahead the top candidate must be to
+# auto-pick rather than ask which person was meant. Higher = stricter / asks
+# more often. The point is never to message the wrong person on a shaky guess.
+CONTACT_MATCH_THRESHOLD: float = float(_get("CONTACT_MATCH_THRESHOLD", "0.72"))
+CONTACT_MATCH_MARGIN: float = float(_get("CONTACT_MATCH_MARGIN", "0.12"))
+
+# The user's own WhatsApp name / a self-chat contact, so "send this file to my
+# phone" knows where to go without naming a contact (a file sent to yourself
+# lands on your phone's WhatsApp). Empty = ask who to send to.
+WHATSAPP_SELF_NAME: str = _get("WHATSAPP_SELF_NAME", "")
 
 # ---- Self-extension (Azleem writing its own tools) -------------------------
 # Master switch for add_capability, which lets Azleem write a NEW tool into its

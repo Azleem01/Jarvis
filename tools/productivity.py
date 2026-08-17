@@ -22,7 +22,13 @@ _PYTHONW = Path(sys.executable).parent / "pythonw.exe"
 
 
 def take_screenshot() -> str:
-    """Take a screenshot of the screen, save it to Pictures, and open it.
+    """Take a screenshot of the screen and save it to Pictures.
+
+    Deliberately does NOT pop the image open. These captures are usually taken
+    as part of another task — and a real bug had the model calling this because
+    an on-screen assignment said "include a screenshot", which then flung image
+    windows in front of the user mid-task. Saving quietly and returning the path
+    is all this should ever do; the model relays the path if asked.
 
     Returns:
         A status string with the saved file's path.
@@ -32,10 +38,6 @@ def take_screenshot() -> str:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"jarvis_{_dt.datetime.now():%Y%m%d_%H%M%S}.png"
     image.save(path, format="PNG")
-    try:
-        os.startfile(str(path))  # type: ignore[attr-defined]
-    except OSError:
-        pass  # saved fine; opening it is a nicety
     return f"Screenshot saved to {path}."
 
 

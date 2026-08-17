@@ -431,14 +431,16 @@ def open_url(url: str, browser: str = "", search_query: str = "") -> str:
 # WhatsApp
 # ---------------------------------------------------------------------------
 def send_whatsapp_message(contact_name: str, message: str) -> str:
-    """Send a WhatsApp message to a known contact and auto-send it.
+    """Send a WhatsApp message to a contact by name and auto-send it.
 
-    The contact must exist in the WHATSAPP_CONTACTS map (configured in .env)
-    mapping a name to an E.164 phone number. Opens the WhatsApp desktop app via
-    a deep link with the message pre-filled, then presses Enter to send.
+    Works even for people NOT saved in WHATSAPP_CONTACTS. If a phone number is
+    known — from WHATSAPP_CONTACTS in .env, or a previous send Azleem cached —
+    it uses the fast deep-link path (open the chat pre-filled, press Enter).
+    Otherwise it opens WhatsApp, searches the app itself for the name, clicks the
+    matching chat, types the message and sends it, then remembers the name.
 
     Args:
-        contact_name: Name of the recipient as configured in WHATSAPP_CONTACTS.
+        contact_name: Name of the recipient, as the user said it.
         message: The text to send.
 
     Returns:
@@ -447,33 +449,62 @@ def send_whatsapp_message(contact_name: str, message: str) -> str:
     # Imported lazily so importing this module never requires a display/GUI.
     import pyautogui
 
-    key = contact_name.strip().lower()
-    phone = config.WHATSAPP_CONTACTS.get(key)
-    if not phone:
-        known = ", ".join(sorted(config.WHATSAPP_CONTACTS)) or "(none configured)"
+    name = contact_name.strip()
+    # Resolve the spoken name to a real contact FIRST, so "mom"/"mum" and
+    # relationship words ("daddy") land on the right person instead of a literal
+    # search — and so an unclear match asks rather than messaging the wrong one.
+    try:
+        from tools import contacts
+        kind, value = contacts.resolve_contact(name)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[os_tools] contact resolver unavailable: {exc}")
+        kind, value = "none", []
+    if kind == "ambiguous":
+        options = ", ".join(value)
         return (
-            f"Unknown contact '{contact_name}'. Add them to WHATSAPP_CONTACTS "
-            f"in .env. Known contacts: {known}."
+            f"I know more than one contact like '{name}': {options}. "
+            f"Who did you mean?"
         )
+    if kind == "match" and value.strip().lower() != name.strip().lower():
+        # Switch to the saved spelling only when it is genuinely a different
+        # name (mom -> Mum); keep the user's own casing otherwise, since .env
+        # keys are stored lower-cased and "Sent to alex" reads worse than "Alex".
+        name = value
+
+    phone = config.WHATSAPP_CONTACTS.get(name.lower())
+    if not phone:
+        # A previously-reached contact may have a number cached. The cache also
+        # owns the vision-driven search path used when we still have no number.
+        try:
+            from tools import whatsapp
+        except Exception as exc:  # pragma: no cover - defensive
+            return (
+                f"Can't message {name}: no saved number and the search path is "
+                f"unavailable ({exc})."
+            )
+        phone = whatsapp.cached_phone(name)
+        if not phone:
+            # No number anywhere — drive WhatsApp's own UI to find them by name.
+            return whatsapp.send_via_ui(name, message)
 
     encoded = urllib.parse.quote(message)
     deep_link = f"whatsapp://send?phone={phone}&text={encoded}"
     try:
         os.startfile(deep_link)  # type: ignore[attr-defined]
     except OSError as exc:
-        return f"Could not open WhatsApp for {contact_name}: {exc}"
+        return f"Could not open WhatsApp for {name}: {exc}"
 
     # Wait for WhatsApp to focus the chat and populate the message box. Polling
     # for the window returns as soon as it is actually up, instead of always
     # paying a fixed worst-case wait.
-    if not _wait_for_window("whatsapp", timeout=8.0):
+    if not _wait_for_window("whatsapp", timeout=config.WHATSAPP_SEND_TIMEOUT):
         return (
-            f"Opened WhatsApp for {contact_name}, but its window never came to "
+            f"Opened WhatsApp for {name}, but its window never came to "
             "the front — the message is typed but not sent."
         )
-    time.sleep(0.6)  # let the chat pane finish populating the message box
+    time.sleep(config.WHATSAPP_SETTLE_SECONDS)  # let the message box populate
     pyautogui.press("enter")
-    return f"Sent WhatsApp message to {contact_name}."
+    return f"Sent WhatsApp message to {name}."
 
 
 def _wait_for_window(title_substring: str, timeout: float = 8.0) -> bool:

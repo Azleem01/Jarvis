@@ -218,3 +218,62 @@ def parse_json(text: str):
             except json.JSONDecodeError:
                 return None
     return None
+
+
+# Ask-one-thing-per-call pointing. Bundling a locate into a bigger vision call
+# was measured at 2/5 accuracy versus 3/3 when asked on its own (see the design
+# notes in tools/quiz.py), so this prompt requests exactly one box and nothing
+# else. Shared here so any tool that needs "find this element and click it"
+# (the quiz loop, WhatsApp contact search, ...) uses the same proven path.
+_POINT_PROMPT = (
+    "The image is a screenshot. Find the single clickable element described "
+    'below and return ONLY compact JSON: {{"found": true, "box": [ymin, xmin, '
+    'ymax, xmax]}} with integers 0-1000 normalised over the image (Gemini '
+    "bounding-box convention), covering the element's full clickable area. "
+    'If it is not visible, return {{"found": false}}.\n'
+    "ELEMENT: {description}"
+)
+
+
+def locate(description, jpeg):
+    """Bounding box of one on-screen element, described in words.
+
+    Args:
+        description: What to find, anchored to visible text where possible
+            (e.g. 'the contact row whose name is exactly <the name>').
+        jpeg: The screenshot bytes from ``capture_screen``.
+
+    Returns:
+        A ``[ymin, xmin, ymax, xmax]`` list (0-1000) or ``None`` if the element
+        is not visible or the request failed. Never raises.
+    """
+    # Lazy imports: keep this module importable without the network stack, and
+    # avoid any import cycle with providers.
+    import providers
+    from google.genai import types
+
+    contents = [
+        types.Part.from_bytes(data=jpeg, mime_type=MIME_TYPE),
+        _POINT_PROMPT.format(description=description),
+    ]
+    try:
+        response = providers.vision_generate(contents, None, needs_pointing=True)
+    except Exception as exc:
+        print(f"[screen] locate request failed: {exc}")
+        return None
+    data = parse_json(response.text or "")
+    if not data or not data.get("found"):
+        return None
+    box = data.get("box")
+    return box if valid_box(box) else None
+
+
+def click_box(box, image_size) -> bool:
+    """Click the centre of a normalised box. Returns False on the fail-safe."""
+    cx, cy = box_to_logical(box, *image_size)
+    try:
+        pyautogui.moveTo(cx, cy, duration=0.12)
+        pyautogui.click()
+    except pyautogui.FailSafeException:
+        return False
+    return True
